@@ -1,48 +1,51 @@
-import { after } from 'next/server';
 import { gunzipSync } from 'node:zlib';
 
 const FLAG_CDN = `https://preview.ff-cdn.datadoghq.com/precompute-assignments`;
 
-// Quick-and-dirty debug sink. Remove once payload shape is confirmed.
-const DEBUG_WEBHOOK_URL = 'https://webhook.site/acb36fc9-f96e-4323-ac37-e1a51b78888f';
-
 const LOG_BODY_MAX_CHARS = 2000;
 
-async function decodePayload(req: Request) {
-  const contentEncoding = req.headers.get('content-encoding') ?? '';
-  const contentType = req.headers.get('content-type') ?? '';
-
-  const raw = Buffer.from(await req.clone().arrayBuffer());
+function decodeBody(raw: Buffer, contentEncoding: string) {
   const text = contentEncoding.includes('gzip') ? gunzipSync(raw).toString('utf-8') : raw.toString('utf-8');
-
-  return {
-    contentType,
-    contentEncoding,
-    bytes: raw.length,
-    body: text.length > LOG_BODY_MAX_CHARS ? `${text.slice(0, LOG_BODY_MAX_CHARS)}…(truncated)` : text,
-  };
+  return text.length > LOG_BODY_MAX_CHARS ? `${text.slice(0, LOG_BODY_MAX_CHARS)}…(truncated)` : text;
 }
 
-async function forwardToDebugWebhook(payload: Awaited<ReturnType<typeof decodePayload>>) {
+async function logRequestPayload(req: Request) {
   try {
-    await fetch(DEBUG_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+    const contentEncoding = req.headers.get('content-encoding') ?? '';
+    const contentType = req.headers.get('content-type') ?? '';
+    const raw = Buffer.from(await req.clone().arrayBuffer());
+
+    console.log('[flag-config] request payload', {
+      contentType,
+      contentEncoding,
+      bytes: raw.length,
+      body: decodeBody(raw, contentEncoding),
     });
   } catch (err) {
-    console.error('[flag-config] failed to forward payload to debug webhook', err);
+    console.error('[flag-config] failed to decode request payload for logging', err);
+  }
+}
+
+async function logResponsePayload(response: Response) {
+  try {
+    const contentEncoding = response.headers.get('content-encoding') ?? '';
+    const contentType = response.headers.get('content-type') ?? '';
+    const raw = Buffer.from(await response.clone().arrayBuffer());
+
+    console.log('[flag-config] response payload', {
+      status: response.status,
+      contentType,
+      contentEncoding,
+      bytes: raw.length,
+      body: decodeBody(raw, contentEncoding),
+    });
+  } catch (err) {
+    console.error('[flag-config] failed to decode response payload for logging', err);
   }
 }
 
 export async function POST(req: Request) {
-  try {
-    const payload = await decodePayload(req);
-    console.log('[flag-config] payload', payload);
-    after(() => forwardToDebugWebhook(payload));
-  } catch (err) {
-    console.error('[flag-config] failed to decode payload for logging', err);
-  }
+  await logRequestPayload(req);
 
   const headers: HeadersInit = {
     'Content-Type': req.headers.get('Content-Type') ?? 'application/vnd.api+json',
@@ -61,6 +64,8 @@ export async function POST(req: Request) {
     // @ts-ignore – required for streaming request body in Node.js
     duplex: 'half',
   });
+
+  await logResponsePayload(response);
 
   return new Response(response.body, { status: response.status });
 }
