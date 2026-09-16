@@ -25,5 +25,7 @@ export async function POST(req: NextRequest) {
     duplex: 'half',
   });
 
+  console.log('req.body', req.body);
+
   return new Response(response.body, { status: response.status });
 }
