@@ -1,8 +1,13 @@
 import { gunzipSync } from 'node:zlib';
+import { randomUUID } from 'node:crypto';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { after } from 'next/server';
 
 const FLAG_CDN = `https://preview.ff-cdn.datadoghq.com/precompute-assignments`;
 
 const LOG_BODY_MAX_CHARS = 2000;
+
+const s3 = new S3Client({ region: process.env.AWS_REGION });
 
 function decodeText(raw: Buffer, contentEncoding: string) {
   return contentEncoding.includes('gzip') ? gunzipSync(raw).toString('utf-8') : raw.toString('utf-8');
@@ -31,18 +36,16 @@ async function logResponsePayload(response: Response, text: string, raw: Buffer)
   });
 }
 
-function buildAssignmentRecord(requestText: string, responseText: string) {
+// One record per flag returned in the response — a single request can evaluate multiple flags at once.
+function buildAssignmentRecords(requestText: string, responseText: string) {
   const requestJson = JSON.parse(requestText);
   const responseJson = JSON.parse(responseText);
 
   const subject = requestJson?.data?.attributes?.subject ?? {};
   const targetingAttributes = subject.targeting_attributes ?? {};
-
   const flags = responseJson?.data?.attributes?.flags ?? {};
-  const flagName = Object.keys(flags)[0];
-  const flag = flagName ? flags[flagName] : {};
 
-  return {
+  const shared = {
     targetingKey: subject.targeting_key,
     targetingAttributes,
     userId: targetingAttributes.userId,
@@ -52,13 +55,37 @@ function buildAssignmentRecord(requestText: string, responseText: string) {
     sdkVersion: requestJson?.data?.attributes?.source?.sdk_version,
     createdAt: responseJson?.data?.attributes?.createdAt,
     environmentName: responseJson?.data?.attributes?.environment?.name,
+  };
+
+  return Object.entries(flags).map(([flagName, flag]: [string, any]) => ({
+    ...shared,
     flagName,
     variationType: flag.variationType,
     variationValue: flag.variationValue,
     allocationKey: flag.allocationKey,
     variationKey: flag.variationKey,
     reason: flag.reason,
-  };
+  }));
+}
+
+async function writeAssignmentsToS3(records: unknown[]) {
+  const bucket = process.env.S3_BUCKET_NAME;
+  if (!bucket) {
+    console.error('[flag-config] S3_BUCKET_NAME not set, skipping S3 write');
+    return;
+  }
+
+  const receivedAt = new Date();
+  const datePrefix = receivedAt.toISOString().slice(0, 10);
+  const key = `flag-assignments/dt=${datePrefix}/${receivedAt.getTime()}-${randomUUID()}.json`;
+  const body = records.map((record) => JSON.stringify({ ...(record as object), receivedAt: receivedAt.toISOString() })).join('\n');
+
+  try {
+    await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: 'application/x-ndjson' }));
+    console.log('[flag-config] wrote assignments to s3', { bucket, key, records: records.length });
+  } catch (err) {
+    console.error('[flag-config] failed to write assignments to s3', err);
+  }
 }
 
 export async function POST(req: Request) {
@@ -100,9 +127,13 @@ export async function POST(req: Request) {
 
   if (reqText && resText) {
     try {
-      console.log('[flag-config] assignment', buildAssignmentRecord(reqText, resText));
+      const records = buildAssignmentRecords(reqText, resText);
+      console.log('[flag-config] assignments', records);
+      if (records.length > 0) {
+        after(() => writeAssignmentsToS3(records));
+      }
     } catch (err) {
-      console.error('[flag-config] failed to build assignment record', err);
+      console.error('[flag-config] failed to build assignment records', err);
     }
   }
 
