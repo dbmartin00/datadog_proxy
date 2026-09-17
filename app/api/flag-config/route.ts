@@ -47,7 +47,6 @@ function buildAssignmentRecords(requestText: string, responseText: string) {
 
   const shared = {
     targetingKey: subject.targeting_key,
-    targetingAttributes,
     userId: targetingAttributes.userId,
     userRole: targetingAttributes.userRole,
     env: requestJson?.data?.attributes?.env?.dd_env,
@@ -61,7 +60,9 @@ function buildAssignmentRecords(requestText: string, responseText: string) {
     ...shared,
     flagName,
     variationType: flag.variationType,
-    variationValue: flag.variationValue,
+    // Athena/Glue columns are fixed-type; variationValue's shape varies per flag,
+    // so it's stored as a JSON string and unpacked per-query with json_extract.
+    variationValue: JSON.stringify(flag.variationValue),
     allocationKey: flag.allocationKey,
     variationKey: flag.variationKey,
     reason: flag.reason,
